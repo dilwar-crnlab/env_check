@@ -6,6 +6,7 @@ import math
 from collections import defaultdict
 from typing import Optional, Sequence, Tuple
 
+from typing import Any
 import gym
 import networkx as nx
 import numpy as np
@@ -14,6 +15,7 @@ from optical_rl_gym.utils import Path, Service
 from optical_rl_gym.osnr_calculator import *
 
 from .optical_network_env import OpticalNetworkEnv
+from optical_rl_gym.logging_utils import ServiceRequestLogger, LoggingConfig
 
 
 class RMSAEnv(OpticalNetworkEnv):
@@ -65,7 +67,8 @@ class RMSAEnv(OpticalNetworkEnv):
         reset: bool = True,
         channel_width: float = 12.5,
         k_paths=5,
-        j=1
+        j=1,
+        enable_logging=True, log_config=None, log_dir='logs'
     ):
         super().__init__(
             topology,
@@ -79,8 +82,17 @@ class RMSAEnv(OpticalNetworkEnv):
             k_paths=k_paths
         )
 
-        # make sure that modulations are set in the topology
-        #assert "modulations" in self.topology.graph
+        # Initialize logger
+        self.enable_logging = enable_logging
+        if self.enable_logging:
+            config = log_config or LoggingConfig(detail_level='medium')
+            self.request_logger = ServiceRequestLogger(
+                log_dir=log_dir,
+                config=config,
+                experiment_name=None  # Can set experiment name
+            )
+        else:
+            self.request_logger = None
 
         # ADD THIS: Store bit rates and probabilities
         self.bit_rates = list(bit_rates)
@@ -104,6 +116,8 @@ class RMSAEnv(OpticalNetworkEnv):
 
         self.bit_rate_requested = 0
         self.bit_rate_accepted = 0
+        self.episode_bit_rate_requested=0
+        self.episode_bit_rate_accepted = 0
         self.episode_services_processed = 0
         self.episode_services_accepted = 0
 
@@ -223,9 +237,10 @@ class RMSAEnv(OpticalNetworkEnv):
         
         self.episode_actions_taken = np.zeros((self.k_paths + 1, self.num_bands + 1, self.num_spectrum_resources + 1), dtype=int)
         
+        # Action space for the AGENT (this still respects allow_rejection)
         self.action_space = gym.spaces.MultiDiscrete(
             (
-                self.k_paths + self.reject_action,
+                self.k_paths + self.reject_action,      # Agent can only reject if allowed
                 self.num_bands + self.reject_action,
                 self.num_spectrum_resources + self.reject_action,
             )
@@ -249,48 +264,36 @@ class RMSAEnv(OpticalNetworkEnv):
         if reset:
             self.reset(only_episode_counters=False)
 
+    # Modulation format
+    #Ref. Paper "ISRS impact-reduced routing, modulation, band, and spectrum allocation algorithm in 
+    # C + L-bands elastic optical networks"
+    # [BPSK, QPSK, 8QAM, 16QAM]
+    #capacity = [12.5, 25, 37.5, 50]
+    capacity = [50, 100, 150, 200]
+    modulations = list()
+    modulations.append({'modulation': 'PM_BPSK', 'capacity': capacity[0], 'max_reach': 4000})
+    modulations.append({'modulation': 'PM_QPSK', 'capacity': capacity[1], 'max_reach': 2000})
+    modulations.append({'modulation': 'PM_8QAM', 'capacity': capacity[2], 'max_reach': 1000})
+    modulations.append({'modulation': 'PM_16QAM', 'capacity': capacity[3], 'max_reach': 500})
+
+
     def _calculate_center_frequency(self, service: Service) -> float:
         """
-        Calculate the center frequency of a service allocation.
-        
-        Note: service.initial_slot is stored in GLOBAL coordinates (0-823)
-        after being shifted by _provision_path().
-        
-        Args:
-            service: Service object with allocation details
-            
-        Returns:
-            float: Center frequency in Hz
-            
-        Example:
-            C-band allocation at global slots 100-109:
-                - Band start: 191.7 THz
-                - Local center: slot 104.5
-                - Frequency: 191.7 THz + (104.5 × 12.5 GHz) = 193.006 THz
-                
-            L-band allocation at global slots 400-409:
-                - Band start: 185.7 THz  
-                - Local slots: 56-65 (400-344 to 409-344)
-                - Local center: slot 60.5
-                - Frequency: 185.7 THz + (60.5 × 12.5 GHz) = 186.456 THz
+        Calculate center frequency using local slots considering slot center offset.
         """
-        # Step 1: Calculate center slot in GLOBAL coordinates
-        global_start_slot = service.initial_slot
-        global_end_slot = service.initial_slot + service.number_slots - 1
-        global_center_slot = (global_start_slot + global_end_slot) / 2.0
+        local_start_slot = service.initial_slot
+        local_end_slot = local_start_slot + service.number_slots - 1
         
-        # Step 2: Convert to BAND-LOCAL coordinates
-        # Get the starting slot index for this band
-        band_start_slot = self.get_shift(service.band)[0]
-        local_center_slot = global_center_slot - band_start_slot
+        # Compute local center slot index (fractional)
+        local_center_slot = (local_start_slot + local_end_slot) / 2.0
+        #print("local_center_slot",local_center_slot)
         
-        # Step 3: Calculate center frequency
-        # Start from band's base frequency and add offset
         band_base_frequency = self.band_frequencies[service.band]['start']
-        frequency_offset = local_center_slot * self.channel_width * 1e9  # Convert GHz to Hz
-        center_freq = band_base_frequency + frequency_offset
+        slot_width_thz = self.channel_width * 1e-3  # Convert GHz to THz
         
-        # Optional: Validate frequency is within band limits
+        # Add half slot width offset to get center frequency within slot 
+        center_freq = band_base_frequency + (local_center_slot + 0.5) * slot_width_thz * 1e12  # in Hz
+        
         band_end_frequency = self.band_frequencies[service.band]['end']
         if not (band_base_frequency <= center_freq <= band_end_frequency):
             self.logger.warning(
@@ -300,6 +303,7 @@ class RMSAEnv(OpticalNetworkEnv):
             )
         
         return center_freq
+
 
     # Add this method to calculate average OSNR margins
     def _calculate_avg_osnr_margin(self):
@@ -373,8 +377,17 @@ class RMSAEnv(OpticalNetworkEnv):
     
     def step(self, action: [int]):
         path, band, initial_slot = action[0], action[1], action[2]
+
+        # LOG: Action received
+        if self.request_logger:
+            self.request_logger.log_action_received(
+                service_id=self.current_service.service_id,
+                path_idx=path,
+                band=band,
+                initial_slot=initial_slot
+            )
+
         self.actions_output[path, band, initial_slot] += 1
-        
         # Track bit rate for current service
         current_bit_rate = self.current_service.bit_rate
         self.bit_rate_requested += current_bit_rate
@@ -412,10 +425,16 @@ class RMSAEnv(OpticalNetworkEnv):
                         temp_service = copy.deepcopy(self.current_service)
                         temp_service.bandwidth = slots * 12.5e9  # in Hz
                         temp_service.band = band
-                        temp_service.initial_slot = initial_slot_shift  
+                        temp_service.initial_slot = initial_slot
+                        temp_service.global_initial_slot = initial_slot_shift  
+
                         temp_service.number_slots = slots
                         temp_service.path = temp_path
-                        temp_service.center_frequency = self._calculate_center_frequency(temp_service)
+                        
+                        
+                        center_frequency=self._calculate_center_frequency(temp_service)
+                        temp_service.center_frequency = center_frequency
+                        #print("temp centerfreq", temp_service.center_frequency)
                         
                         # Get modulation format
                         modulation = self.get_modulation_format(temp_path, self.num_bands, band, self.modulations)['modulation']
@@ -423,6 +442,8 @@ class RMSAEnv(OpticalNetworkEnv):
                         
                         # First check OSNR for the new service (SNR condition check)
                         osnr_db = self.osnr_calculator.calculate_osnr(temp_service, self.topology)
+                        #print("Temp service OSNR[dB]", osnr_db, "OSNR th",self.OSNR_th[temp_service.modulation_format])
+                        
                         
                         if osnr_db < self.OSNR_th[temp_service.modulation_format]:
                             blocking_reason = 'osnr_threshold_violation'
@@ -440,6 +461,7 @@ class RMSAEnv(OpticalNetworkEnv):
                                 # Provision the path (this will update network fragmentation)
                                 self._provision_path(temp_path, initial_slot, slots, band, self.current_service.arrival_time)
                                 self.current_service.accepted = True
+                                self.current_service.center_frequency = center_frequency
                                 self.current_service.modulation_format = modulation
                                 self.actions_taken[path, band, initial_slot] += 1
                                 self._add_release(self.current_service)
@@ -451,6 +473,7 @@ class RMSAEnv(OpticalNetworkEnv):
                                 # Update bit rate acceptance counters
                                 self.bit_rate_accepted += current_bit_rate
                                 self.episode_bit_rate_accepted += current_bit_rate
+                                #print("Service:", self.current_service)
         
         # Record blocking reason if service was not accepted
         if not self.current_service.accepted:
@@ -530,53 +553,522 @@ class RMSAEnv(OpticalNetworkEnv):
         self._next_service()
         return (self.observation(), reward, self.episode_services_processed == self.episode_length, info,)
 
- 
-    def _calculate_adaptive_weights(self):
-        """
-        Calculate adaptive beta and gamma weights based on network utilization.
+
+    # def step(self, action: [int]):
+    #     """
+    #     Execute action and allocate service.
         
-        Returns:
-            tuple: (beta, gamma) - fragmentation and OSNR weights
-        """
-        # Calculate network-wide utilization
-        total_slots = self.num_spectrum_resources * self.topology.number_of_edges() * self.num_bands
-        occupied_slots = total_slots - np.sum(self.topology.graph["available_slots"])
-        utilization = occupied_slots / total_slots if total_slots > 0 else 0.0
+    #     Validates:
+    #         1. Action validity
+    #         2. Path length
+    #         3. Modulation availability
+    #         4. Spectrum availability
+    #         5. OSNR threshold
+    #         6. OSNR interference
         
-        # Store for monitoring
-        self.current_utilization = utilization
+    #     Logs:
+    #         - Action received
+    #         - Available paths
+    #         - Each validation step (pass/fail with details)
+    #         - Final outcome (acceptance or rejection with reason)
+    #         - Network state after allocation
         
-        # Adaptive weight schedule
-        if utilization < 0.3:
-            # Low utilization: Learn acceptance, light quality focus
-            beta, gamma = 0.2, 0.15
-        elif utilization < 0.5:
-            # Medium-low: Transition to quality awareness
-            progress = (utilization - 0.3) / 0.2
-            beta = 0.2 + 0.3 * progress   # 0.2 → 0.5
-            gamma = 0.15 + 0.25 * progress  # 0.15 → 0.4
-        elif utilization < 0.7:
-            # Medium-high: Quality becomes important
-            progress = (utilization - 0.5) / 0.2
-            beta = 0.5 + 0.15 * progress   # 0.5 → 0.65
-            gamma = 0.4 + 0.15 * progress  # 0.4 → 0.55
-        else:
-            # High utilization: Maximum quality focus
-            progress = min(1.0, (utilization - 0.7) / 0.2)
-            beta = 0.65 + 0.15 * progress   # 0.65 → 0.8
-            gamma = 0.55 + 0.2 * progress   # 0.55 → 0.75
+    #     Args:
+    #         action: [path_index, band, initial_slot]
         
-        return beta, gamma
+    #     Returns:
+    #         tuple: (observation, reward, done, info)
+    #     """
+    #     path, band, initial_slot = action[0], action[1], action[2]
+    #     self.actions_output[path, band, initial_slot] += 1
+        
+    #     # ========================================================================
+    #     # LOGGING: Action Received
+    #     # ========================================================================
+    #     if self.request_logger:
+    #         self.request_logger.log_action_received(
+    #             service_id=self.current_service.service_id,
+    #             path_idx=path,
+    #             band=band,
+    #             initial_slot=initial_slot
+    #         )
+            
+    #         # Log available paths
+    #         k_paths = self.k_shortest_paths[
+    #             self.current_service.source, 
+    #             self.current_service.destination
+    #         ]
+    #         self.request_logger.log_available_paths(
+    #             service_id=self.current_service.service_id,
+    #             paths=k_paths,
+    #             selected_idx=path
+    #         )
+        
+    #     # Track bit rate for current service
+    #     current_bit_rate = self.current_service.bit_rate
+    #     self.bit_rate_requested += current_bit_rate
+    #     self.episode_bit_rate_requested += current_bit_rate
+        
+    #     # Start with service rejected
+    #     self.current_service.accepted = False
+    #     blocking_reason = None
+        
+    #     # ========================================================================
+    #     # VALIDATION 1: Action Validity Check
+    #     # ========================================================================
+    #     if not (path < self.k_paths and band < self.num_bands and initial_slot < self.num_spectrum_resources):
+    #         blocking_reason = 'invalid_action'
+            
+    #         # LOGGING: Validation 1 Failed
+    #         if self.request_logger:
+    #             self.request_logger.log_validation_step(
+    #                 service_id=self.current_service.service_id,
+    #                 step_name="ACTION_VALIDITY_CHECK",
+    #                 passed=False,
+    #                 details={
+    #                     'path_idx': path,
+    #                     'k_paths': self.k_paths,
+    #                     'path_valid': path < self.k_paths,
+    #                     'band': band,
+    #                     'num_bands': self.num_bands,
+    #                     'band_valid': band < self.num_bands,
+    #                     'initial_slot': initial_slot,
+    #                     'num_spectrum_resources': self.num_spectrum_resources,
+    #                     'slot_valid': initial_slot < self.num_spectrum_resources
+    #                 }
+    #             )
+    #     else:
+    #         # LOGGING: Validation 1 Passed
+    #         if self.request_logger:
+    #             self.request_logger.log_validation_step(
+    #                 service_id=self.current_service.service_id,
+    #                 step_name="ACTION_VALIDITY_CHECK",
+    #                 passed=True,
+    #                 details={
+    #                     'path_idx': path,
+    #                     'band': band,
+    #                     'initial_slot': initial_slot
+    #                 }
+    #             )
+            
+    #         # Get the selected path
+    #         temp_path = self.k_shortest_paths[
+    #             self.current_service.source, 
+    #             self.current_service.destination
+    #         ][path]
+            
+    #         # ====================================================================
+    #         # VALIDATION 2: Path Length Check
+    #         # ====================================================================
+    #         max_reach = max(m['max_reach'] for m in self.modulations)
+            
+    #         if temp_path.length > max_reach:
+    #             blocking_reason = 'path_length_exceeded'
+                
+    #             # LOGGING: Validation 2 Failed
+    #             if self.request_logger:
+    #                 self.request_logger.log_validation_step(
+    #                     service_id=self.current_service.service_id,
+    #                     step_name="PATH_LENGTH_CHECK",
+    #                     passed=False,
+    #                     details={
+    #                         'path_length': temp_path.length,
+    #                         'max_reach': max_reach,
+    #                         'path': str(temp_path.node_list),
+    #                         'exceeds_by': temp_path.length - max_reach,
+    #                         'available_modulations': [m['modulation'] for m in self.modulations]
+    #                     }
+    #                 )
+    #         else:
+    #             # LOGGING: Validation 2 Passed
+    #             if self.request_logger:
+    #                 self.request_logger.log_validation_step(
+    #                     service_id=self.current_service.service_id,
+    #                     step_name="PATH_LENGTH_CHECK",
+    #                     passed=True,
+    #                     details={
+    #                         'path_length': temp_path.length,
+    #                         'max_reach': max_reach,
+    #                         'path': str(temp_path.node_list)
+    #                     }
+    #                 )
+                
+    #             # ================================================================
+    #             # VALIDATION 3: Modulation & Slot Calculation Check
+    #             # ================================================================
+    #             slots = self.get_number_slots(temp_path, self.num_bands, band, self.modulations)
+                
+    #             if slots <= 0:
+    #                 blocking_reason = 'no_modulation_available'
+                    
+    #                 # LOGGING: Validation 3 Failed
+    #                 if self.request_logger:
+    #                     self.request_logger.log_validation_step(
+    #                         service_id=self.current_service.service_id,
+    #                         step_name="MODULATION_SLOT_CHECK",
+    #                         passed=False,
+    #                         details={
+    #                             'path_length': temp_path.length,
+    #                             'bit_rate': self.current_service.bit_rate,
+    #                             'slots_calculated': slots,
+    #                             'reason': 'No modulation format available for this path length'
+    #                         }
+    #                     )
+    #             else:
+    #                 # Get modulation format
+    #                 modulation = self.get_modulation_format(temp_path, self.num_bands, band, self.modulations)
+                    
+    #                 # LOGGING: Validation 3 Passed
+    #                 if self.request_logger:
+    #                     self.request_logger.log_validation_step(
+    #                         service_id=self.current_service.service_id,
+    #                         step_name="MODULATION_SLOT_CHECK",
+    #                         passed=True,
+    #                         details={
+    #                             'path_length': temp_path.length,
+    #                             'selected_modulation': modulation['modulation'],
+    #                             'modulation_capacity': modulation['capacity'],
+    #                             'modulation_max_reach': modulation['max_reach'],
+    #                             'required_slots': slots,
+    #                             'bit_rate': self.current_service.bit_rate
+    #                         }
+    #                     )
+                    
+    #                 # ============================================================
+    #                 # VALIDATION 4: Spectrum Availability Check
+    #                 # ============================================================
+    #                 if not self.is_path_free(temp_path, initial_slot, slots, band):
+    #                     blocking_reason = 'spectrum_unavailable'
+                        
+    #                     # LOGGING: Validation 4 Failed
+    #                     if self.request_logger:
+    #                         spectrum_details = self._get_spectrum_availability_details(
+    #                             temp_path, initial_slot, slots, band
+    #                         )
+    #                         self.request_logger.log_validation_step(
+    #                             service_id=self.current_service.service_id,
+    #                             step_name="SPECTRUM_AVAILABILITY_CHECK",
+    #                             passed=False,
+    #                             details=spectrum_details
+    #                         )
+    #                 else:
+    #                     # LOGGING: Validation 4 Passed
+    #                     if self.request_logger:
+    #                         spectrum_details = self._get_spectrum_availability_details(
+    #                             temp_path, initial_slot, slots, band
+    #                         )
+    #                         self.request_logger.log_validation_step(
+    #                             service_id=self.current_service.service_id,
+    #                             step_name="SPECTRUM_AVAILABILITY_CHECK",
+    #                             passed=True,
+    #                             details=spectrum_details
+    #                         )
+                        
+    #                     # ========================================================
+    #                     # VALIDATION 5: OSNR Threshold Check
+    #                     # ========================================================
+    #                     # Create temporary service for OSNR calculations
+    #                     x = self.get_shift(band)[0]
+    #                     initial_slot_shift = initial_slot + x
+    #                     temp_service = copy.deepcopy(self.current_service)
+    #                     temp_service.bandwidth = slots * 12.5e9  # in Hz
+    #                     temp_service.band = band
+    #                     temp_service.initial_slot = initial_slot_shift
+    #                     temp_service.number_slots = slots
+    #                     temp_service.path = temp_path
+    #                     temp_service.center_frequency = self._calculate_center_frequency(temp_service)
+                        
+    #                     # Get modulation format
+    #                     temp_service.modulation_format = modulation['modulation']
+                        
+    #                     # Calculate OSNR (logging happens inside osnr_calculator)
+    #                     osnr_db = self.osnr_calculator.calculate_osnr(temp_service, self.topology)
+                        
+    #                     if osnr_db < self.OSNR_th[temp_service.modulation_format]:
+    #                         blocking_reason = 'osnr_threshold_violation'
+                            
+    #                         # LOGGING: Validation 5 Failed
+    #                         if self.request_logger:
+    #                             self.request_logger.log_validation_step(
+    #                                 service_id=self.current_service.service_id,
+    #                                 step_name="OSNR_THRESHOLD_CHECK",
+    #                                 passed=False,
+    #                                 details={
+    #                                     'calculated_osnr': osnr_db,
+    #                                     'required_osnr': self.OSNR_th[temp_service.modulation_format],
+    #                                     'osnr_shortfall': osnr_db - self.OSNR_th[temp_service.modulation_format],
+    #                                     'modulation': temp_service.modulation_format,
+    #                                     'center_frequency_thz': temp_service.center_frequency / 1e12,
+    #                                     'bandwidth_ghz': temp_service.bandwidth / 1e9,
+    #                                     'path': str(temp_path.node_list)
+    #                                 }
+    #                             )
+    #                     else:
+    #                         # LOGGING: Validation 5 Passed
+    #                         if self.request_logger:
+    #                             self.request_logger.log_validation_step(
+    #                                 service_id=self.current_service.service_id,
+    #                                 step_name="OSNR_THRESHOLD_CHECK",
+    #                                 passed=True,
+    #                                 details={
+    #                                     'calculated_osnr': osnr_db,
+    #                                     'required_osnr': self.OSNR_th[temp_service.modulation_format],
+    #                                     'osnr_margin': osnr_db - self.OSNR_th[temp_service.modulation_format],
+    #                                     'modulation': temp_service.modulation_format,
+    #                                     'center_frequency_thz': temp_service.center_frequency / 1e12,
+    #                                     'bandwidth_ghz': temp_service.bandwidth / 1e9
+    #                                 }
+    #                             )
+                            
+    #                         # ====================================================
+    #                         # VALIDATION 6: OSNR Interference Check
+    #                         # ====================================================
+    #                         if not self._check_existing_services_osnr(temp_path, band, temp_service):
+    #                             blocking_reason = 'osnr_interference_violation'
+                                
+    #                             # LOGGING: Validation 6 Failed
+    #                             if self.request_logger:
+    #                                 affected_details = self._get_affected_services_details()
+                                    
+    #                                 # Find which services would fail
+    #                                 failing_services = [s for s in affected_details if s['would_fail']]
+                                    
+    #                                 self.request_logger.log_validation_step(
+    #                                     service_id=self.current_service.service_id,
+    #                                     step_name="OSNR_INTERFERENCE_CHECK",
+    #                                     passed=False,
+    #                                     details={
+    #                                         'num_affected_services': len(affected_details),
+    #                                         'num_failing_services': len(failing_services),
+    #                                         'affected_services': affected_details,
+    #                                         'reason': 'Would cause existing services to drop below OSNR threshold'
+    #                                     }
+    #                                 )
+    #                         else:
+    #                             # LOGGING: Validation 6 Passed
+    #                             if self.request_logger:
+    #                                 affected_details = self._get_affected_services_details()
+    #                                 self.request_logger.log_validation_step(
+    #                                     service_id=self.current_service.service_id,
+    #                                     step_name="OSNR_INTERFERENCE_CHECK",
+    #                                     passed=True,
+    #                                     details={
+    #                                         'num_affected_services': len(affected_details),
+    #                                         'affected_services': affected_details,
+    #                                         'all_services_ok': True,
+    #                                         'note': 'All affected services maintain acceptable OSNR'
+    #                                     }
+    #                                 )
+                                
+    #                             # ================================================
+    #                             # ALL VALIDATIONS PASSED - ACCEPT SERVICE
+    #                             # ================================================
+    #                             self.current_service.current_OSNR = osnr_db
+    #                             self.current_service.OSNR_th = self.OSNR_th[temp_service.modulation_format]
+    #                             self.current_service.OSNR_margin = self.current_service.current_OSNR - self.current_service.OSNR_th
+                                
+    #                             # Provision the path
+    #                             self._provision_path(temp_path, initial_slot, slots, band, self.current_service.arrival_time)
+    #                             self.current_service.accepted = True
+    #                             self.current_service.modulation_format = modulation['modulation']
+    #                             self.actions_taken[path, band, initial_slot] += 1
+    #                             self._add_release(self.current_service)
+                                
+    #                             # Update acceptance counters
+    #                             self.blocking_reasons['total_accepted'] += 1
+    #                             self.episode_blocking_reasons['total_accepted'] += 1
+                                
+    #                             # Update bit rate acceptance counters
+    #                             self.bit_rate_accepted += current_bit_rate
+    #                             self.episode_bit_rate_accepted += current_bit_rate
+                                
+    #                             # ============================================
+    #                             # LOGGING: Service Accepted
+    #                             # ============================================
+    #                             if self.request_logger:
+    #                                 self.request_logger.log_service_accepted(
+    #                                     service_id=self.current_service.service_id,
+    #                                     path=temp_path,
+    #                                     band=band,
+    #                                     initial_slot=initial_slot_shift,
+    #                                     number_slots=slots,
+    #                                     modulation=modulation['modulation'],
+    #                                     osnr_db=osnr_db,
+    #                                     osnr_margin=self.current_service.OSNR_margin,
+    #                                     center_frequency=self.current_service.center_frequency / 1e12,
+    #                                     bandwidth=self.current_service.bandwidth / 1e9,
+    #                                     links_used=[f"{temp_path.node_list[i]}→{temp_path.node_list[i+1]}" 
+    #                                             for i in range(len(temp_path.node_list)-1)]
+    #                                 )
+                                    
+    #                                 # LOGGING: Network State After Allocation
+    #                                 self._log_network_state_after_allocation(temp_path, band)
+        
+    #     # ========================================================================
+    #     # HANDLE REJECTION
+    #     # ========================================================================
+    #     if not self.current_service.accepted:
+    #         self.actions_taken[self.k_paths, self.num_bands, self.num_spectrum_resources] += 1
+            
+    #         # Clear OSNR tracking if service was blocked
+    #         if hasattr(self, '_affected_services_osnr_before'):
+    #             self._affected_services_osnr_before.clear()
+    #         if hasattr(self, '_affected_services_osnr_after'):
+    #             self._affected_services_osnr_after.clear()
+            
+    #         # Update blocking reason counters
+    #         if blocking_reason:
+    #             self.blocking_reasons[blocking_reason] += 1
+    #             self.episode_blocking_reasons[blocking_reason] += 1
+    #             self.blocking_reasons['total_blocked'] += 1
+    #             self.episode_blocking_reasons['total_blocked'] += 1
+                
+    #             # Store blocking reason in current service for analysis
+    #             self.current_service.blocking_reason = blocking_reason
+                
+    #             # Log detailed blocking information
+    #             self.logger.debug(f"Service {self.current_service.service_id} blocked due to: {blocking_reason}")
+                
+    #             # ================================================================
+    #             # LOGGING: Service Rejected
+    #             # ================================================================
+    #             if self.request_logger:
+    #                 self.request_logger.log_service_rejected(
+    #                     service_id=self.current_service.service_id,
+    #                     blocking_reason=blocking_reason,
+    #                     attempted_path=temp_path if 'temp_path' in locals() else None,
+    #                     attempted_band=band,
+    #                     attempted_slot=initial_slot,
+    #                     details=self._get_rejection_details(blocking_reason)
+    #                 )
+        
+    #     # Add service to history
+    #     self.topology.graph["services"].append(self.current_service)
+        
+    #     # Get path for reward calculation
+    #     k_paths = self.k_shortest_paths[self.current_service.source, self.current_service.destination]
+    #     path_selected = k_paths[path] if path < self.k_paths else None
+    #     reward = self.reward(band, path_selected)
+        
+    #     # Clean up OSNR tracking after reward calculation
+    #     if hasattr(self, '_affected_services_osnr_before'):
+    #         self._affected_services_osnr_before.clear()
+    #     if hasattr(self, '_affected_services_osnr_after'):
+    #         self._affected_services_osnr_after.clear()
+
+    #     # Calculate blocking rates by reason
+    #     total_processed = self.services_processed
+    #     episode_total_processed = self.episode_services_processed
+        
+    #     blocking_rate_breakdown = {}
+    #     episode_blocking_rate_breakdown = {}
+        
+    #     if total_processed > 0:
+    #         for reason in self.blocking_reasons:
+    #             if reason not in ['total_blocked', 'total_accepted']:
+    #                 blocking_rate_breakdown[f"{reason}_rate"] = self.blocking_reasons[reason] / total_processed
+        
+    #     if episode_total_processed > 0:
+    #         for reason in self.episode_blocking_reasons:
+    #             if reason not in ['total_blocked', 'total_accepted']:
+    #                 episode_blocking_rate_breakdown[f"episode_{reason}_rate"] = self.episode_blocking_reasons[reason] / episode_total_processed
+
+    #     # Calculate bit rate blocking rates
+    #     bit_rate_blocking_rate = (self.bit_rate_requested - self.bit_rate_accepted) / self.bit_rate_requested if self.bit_rate_requested > 0 else 0.0
+    #     episode_bit_rate_blocking_rate = (self.episode_bit_rate_requested - self.episode_bit_rate_accepted) / self.episode_bit_rate_requested if self.episode_bit_rate_requested > 0 else 0.0
+
+    #     # Create info dictionary with metrics
+    #     info = {
+    #         "band": band if self.current_service.accepted else -1,
+    #         "service_blocking_rate": (self.services_processed - self.services_accepted) / self.services_processed,
+    #         "episode_service_blocking_rate": (self.episode_services_processed - self.episode_services_accepted) / self.episode_services_processed,
+    #         "bit_rate_blocking_rate": bit_rate_blocking_rate,
+    #         "episode_bit_rate_blocking_rate": episode_bit_rate_blocking_rate,
+    #         "blocking_reason": blocking_reason if blocking_reason else "accepted",
+    #         "blocking_reasons_count": self.blocking_reasons.copy(),
+    #         "episode_blocking_reasons_count": self.episode_blocking_reasons.copy(),
+    #         "network_fragmentation": self.topology.graph.get("current_network_fragmentation", 0.0),
+    #         "band_fragmentation": self.topology.graph.get("current_band_fragmentation", {}).copy(),
+    #         **blocking_rate_breakdown,
+    #         **episode_blocking_rate_breakdown
+    #     }
+
+    #     self._new_service = False
+    #     self._next_service()
+        
+    #     return (self.observation(), reward, self.episode_services_processed == self.episode_length, info)
 
 
     def reset(self, only_episode_counters=True):
         """
         Reset environment for new episode.
         
+        Simple DQN version without curriculum learning.
+        
         Args:
             only_episode_counters: If True, soft reset (between episodes)
                                 If False, hard reset (full reinitialization)
+        
+        Logs:
+            - Episode statistics before reset (if soft reset)
+        
+        Returns:
+            np.array: Initial observation after reset
         """
+        # ========================================================================
+        # LOG EPISODE STATISTICS (Before Episode Reset)
+        # ========================================================================
+        if only_episode_counters and self.request_logger:
+            # Calculate all statistics for the completed episode
+            stats = {
+                'episode': self.episode_services_processed // self.episode_length if self.episode_length > 0 else 0,
+                'services_processed': self.episode_services_processed,
+                'services_accepted': self.episode_services_accepted,
+                'blocking_rate': (
+                    (self.episode_services_processed - self.episode_services_accepted) / 
+                    self.episode_services_processed 
+                    if self.episode_services_processed > 0 else 0
+                ),
+                
+                # Blocking reasons breakdown
+                'blocking_reasons': self.episode_blocking_reasons.copy() if hasattr(self, 'episode_blocking_reasons') else {},
+                
+                # Bit rate statistics
+                'bit_rate_requested': (
+                    self.episode_bit_rate_requested 
+                    if hasattr(self, 'episode_bit_rate_requested') else 0
+                ),
+                'bit_rate_accepted': (
+                    self.episode_bit_rate_accepted 
+                    if hasattr(self, 'episode_bit_rate_accepted') else 0
+                ),
+                'bit_rate_blocking_rate': (
+                    (self.episode_bit_rate_requested - self.episode_bit_rate_accepted) /
+                    self.episode_bit_rate_requested 
+                    if hasattr(self, 'episode_bit_rate_requested') and self.episode_bit_rate_requested > 0 
+                    else 0
+                ),
+                
+                # Network utilization
+                'network_utilization': self._calculate_network_utilization(),
+                'band_utilization': self._calculate_band_utilization(),
+                
+                # OSNR statistics
+                'avg_osnr_margin': self._calculate_avg_osnr_margin(),
+                'band_osnr_margins': self._calculate_band_osnr_margins(),
+                
+                # Fragmentation
+                'network_fragmentation': self.topology.graph.get('current_network_fragmentation', 0.0),
+                'band_fragmentation': self.topology.graph.get('current_band_fragmentation', {}).copy(),
+            }
+            
+            # Log episode statistics
+            self.request_logger.log_episode_statistics(stats)
+            
+            # Flush logger buffer every 10 episodes
+            if self.services_processed > 0 and (self.services_processed // self.episode_length) % 10 == 0:
+                self.request_logger.flush()
+        
         # ========================================================================
         # EPISODE-LEVEL RESET (happens every episode)
         # ========================================================================
@@ -584,30 +1076,28 @@ class RMSAEnv(OpticalNetworkEnv):
         self.episode_services_accepted = 0
         
         # Reset episode bit rate tracking
-        self.episode_bit_rate_requested = 0
-        self.episode_bit_rate_accepted = 0
+        if hasattr(self, 'episode_bit_rate_requested'):
+            self.episode_bit_rate_requested = 0
+        if hasattr(self, 'episode_bit_rate_accepted'):
+            self.episode_bit_rate_accepted = 0
         
         # Reset episode action tracking
         self.episode_actions_output = np.zeros(
             (
-                self.k_paths + self.reject_action,
-                self.num_bands + self.reject_action,
-                self.num_spectrum_resources + self.reject_action,
+                self.k_paths + 1,
+                self.num_bands + 1,
+                self.num_spectrum_resources + 1,
             ),
             dtype=int,
         )
         self.episode_actions_taken = np.zeros(
             (
-                self.k_paths + self.reject_action,
-                self.num_bands + self.reject_action,
-                self.num_spectrum_resources + self.reject_action,
+                self.k_paths + 1,
+                self.num_bands + 1,
+                self.num_spectrum_resources + 1,
             ),
             dtype=int,
         )
-
-
-
-
         
         # Reset episode blocking reasons
         if hasattr(self, 'episode_blocking_reasons'):
@@ -623,54 +1113,9 @@ class RMSAEnv(OpticalNetworkEnv):
             }
         
         # ========================================================================
-        # CURRICULUM LEARNING: EPISODE TRACKING
+        # SOFT RESET: Return observation for new episode
         # ========================================================================
         if only_episode_counters:
-            # Increment total episodes for curriculum progression
-            self.total_episodes += 1
-            
-            # Check for curriculum stage transitions
-            if self.use_curriculum:
-                old_stage = self._get_curriculum_stage()
-                
-                # For fixed curriculum, check if we've crossed thresholds
-                if not self.adaptive_curriculum:
-                    if (old_stage == 1 and 
-                        self.total_episodes == self.curriculum_stage_1_episodes):
-                        print(f"\n{'='*70}")
-                        print(f"{'CURRICULUM STAGE 1 → 2':^70}")
-                        print(f"{'='*70}")
-                        print(f"Episode {self.total_episodes}: Adding Band Selection Component")
-                        print(f"Reward = base + routing + BAND")
-                        print(f"{'='*70}\n")
-                    
-                    elif (old_stage == 2 and 
-                        self.total_episodes == self.curriculum_stage_2_episodes):
-                        print(f"\n{'='*70}")
-                        print(f"{'CURRICULUM STAGE 2 → 3':^70}")
-                        print(f"{'='*70}")
-                        print(f"Episode {self.total_episodes}: Adding Spectrum Allocation Component")
-                        print(f"Reward = base + routing + band + SPECTRUM")
-                        print(f"{'='*70}\n")
-                
-                # Print curriculum statistics every 1000 episodes
-                if self.total_episodes % 1000 == 0:
-                    stats = self.get_curriculum_statistics()
-                    if 'error' not in stats:
-                        print(f"\n{'='*70}")
-                        print(f"Episode {stats['total_episodes']:,} | "
-                            f"Stage {stats['current_stage']}/3 | "
-                            f"Accept: {stats['acceptance_rate']*100:.1f}%")
-                        print(f"{'-'*70}")
-                        print(f"  Routing Mastery:     {stats['routing_mastery_%']:5.1f}% "
-                            f"(avg bonus: {stats['avg_routing_bonus']:.3f})")
-                        print(f"  Band Accuracy:       {stats['band_accuracy']*100:5.1f}% "
-                            f"(correct assignments)")
-                        print(f"  Spectrum Quality:    {stats['avg_spectrum_bonus']:.3f} "
-                            f"(FF/LF policy adherence)")
-                        print(f"  Average Total Reward: {stats['avg_total_reward']:.3f}")
-                        print(f"{'='*70}\n")
-            
             # Increment service counter if there's a pending service
             if self._new_service:
                 self.episode_services_processed += 1
@@ -683,8 +1128,28 @@ class RMSAEnv(OpticalNetworkEnv):
         super().reset()
         
         # Reset cumulative bit rate tracking
-        self.bit_rate_requested = 0
-        self.bit_rate_accepted = 0
+        if hasattr(self, 'bit_rate_requested'):
+            self.bit_rate_requested = 0
+        if hasattr(self, 'bit_rate_accepted'):
+            self.bit_rate_accepted = 0
+        
+        # Reset cumulative action tracking
+        self.actions_output = np.zeros(
+            (
+                self.k_paths + 1,
+                self.num_bands + 1,
+                self.num_spectrum_resources + 1,
+            ),
+            dtype=int,
+        )
+        self.actions_taken = np.zeros(
+            (
+                self.k_paths + 1,
+                self.num_bands + 1,
+                self.num_spectrum_resources + 1,
+            ),
+            dtype=int,
+        )
         
         # Reset cumulative blocking reasons
         if hasattr(self, 'blocking_reasons'):
@@ -723,44 +1188,25 @@ class RMSAEnv(OpticalNetworkEnv):
         )
         
         # ========================================================================
-        # CURRICULUM LEARNING: FULL RESET
+        # PRINT INITIALIZATION MESSAGE (only on full reset)
         # ========================================================================
-        # Reset curriculum tracking (only on full reset)
-        if not hasattr(self, 'total_episodes'):
-            self.total_episodes = 0
-        
-        if not hasattr(self, 'current_curriculum_stage'):
-            self.current_curriculum_stage = 1
-        
-        if not hasattr(self, 'reward_components_history'):
-            self.reward_components_history = []
-        
-        if not hasattr(self, 'recent_routing_bonuses'):
-            self.recent_routing_bonuses = []
-        
-        if not hasattr(self, 'recent_band_accuracies'):
-            self.recent_band_accuracies = []
-        
-        # Print initialization message
-        if self.use_curriculum:
+        if self.request_logger:
             print(f"\n{'='*70}")
-            print(f"{'CURRICULUM LEARNING INITIALIZED':^70}")
+            print(f"{'ENVIRONMENT INITIALIZED':^70}")
             print(f"{'='*70}")
-            print(f"Mode: {'Adaptive (performance-based)' if self.adaptive_curriculum else 'Fixed episodes'}")
-            if not self.adaptive_curriculum:
-                print(f"  Stage 1 (Routing):          Episodes 0 - {self.curriculum_stage_1_episodes:,}")
-                print(f"  Stage 2 (+ Band):           Episodes {self.curriculum_stage_1_episodes:,} - {self.curriculum_stage_2_episodes:,}")
-                print(f"  Stage 3 (+ Spectrum):       Episodes {self.curriculum_stage_2_episodes:,}+")
-            else:
-                print(f"  Stage 1 → 2 trigger:        Routing mastery ≥ {self.routing_mastery_threshold:.2f}")
-                print(f"  Stage 2 → 3 trigger:        Band accuracy ≥ {self.band_accuracy_threshold:.0%}")
-            print(f"\nReward Weights:")
-            print(f"  Routing bonus (w_r):        {self.w_routing}")
-            print(f"  Band bonus (w_b):           {self.w_band}")
-            print(f"  Spectrum bonus (w_s):       {self.w_spectrum}")
-            print(f"\nClassification Thresholds:")
-            print(f"  ML_avg:                     {self.ml_avg} (BPSK/QPSK → L, 8QAM/16QAM → C)")
-            print(f"  F_avg:                      {self.f_avg} slots (FF/LF policy threshold)")
+            print(f"Topology: {self.topology.graph['name']}")
+            print(f"Nodes: {self.topology.number_of_nodes()}")
+            print(f"Edges: {self.topology.number_of_edges()}")
+            print(f"K-shortest paths: {self.k_paths}")
+            print(f"Bands: {self.num_bands} ({'C-band' if self.num_bands == 1 else 'C+L bands'})")
+            print(f"Spectrum resources: {self.num_spectrum_resources} slots")
+            print(f"Episode length: {self.episode_length} services")
+            print(f"Bit rates: {self.bit_rates} Gbps")
+            print(f"Load: {self.load:.2f} Erlangs")
+            print(f"Mean service holding time: {self.mean_service_holding_time:.2f} s")
+            print(f"Logging enabled: {self.enable_logging}")
+            if self.enable_logging:
+                print(f"Log directory: {self.request_logger.log_dir}")
             print(f"{'='*70}\n")
         
         # Generate first service
@@ -883,6 +1329,18 @@ class RMSAEnv(OpticalNetworkEnv):
 
         self.services_processed += 1
         self.episode_services_processed += 1
+
+        # LOG: Service arrival
+        if self.request_logger:
+            self.request_logger.log_service_arrival(
+                service_id=self.current_service.service_id,
+                episode=self.total_episodes if hasattr(self, 'total_episodes') else 0,
+                source=self.current_service.source,
+                destination=self.current_service.destination,
+                bit_rate=self.current_service.bit_rate,
+                arrival_time=self.current_service.arrival_time,
+                holding_time=self.current_service.holding_time
+            )
 
         # release connections up to this point
         while len(self._events) > 0:
@@ -1014,17 +1472,7 @@ class RMSAEnv(OpticalNetworkEnv):
 
         return modulation_format 
 
-    # Modulation format
-    #Ref. Paper "ISRS impact-reduced routing, modulation, band, and spectrum allocation algorithm in 
-    # C + L-bands elastic optical networks"
-    # [BPSK, QPSK, 8QAM, 16QAM]
-    capacity = [12.5, 25, 37.5, 50]
-    #capacity = [50, 100, 150, 200]
-    modulations = list()
-    modulations.append({'modulation': 'PM_BPSK', 'capacity': capacity[0], 'max_reach': 4000})
-    modulations.append({'modulation': 'PM_QPSK', 'capacity': capacity[1], 'max_reach': 2000})
-    modulations.append({'modulation': 'PM_8QAM', 'capacity': capacity[2], 'max_reach': 1000})
-    modulations.append({'modulation': 'PM_16QAM', 'capacity': capacity[3], 'max_reach': 500})
+    
 
     def calculate_link_entropy_fragmentation(self, link_idx: int, band: int):
         """
@@ -1195,9 +1643,10 @@ class RMSAEnv(OpticalNetworkEnv):
         self.topology.graph["running_services"].append(current_service)
         current_service.path = path
         current_service.band = band
-        current_service.initial_slot = initial_slot_shift
+        current_service.global_initial_slot = initial_slot_shift
+        current_service.initial_slot = initial_slot
         current_service.number_slots = number_slots
-        current_service.bandwidth = number_slots * 12.5e9
+        current_service.bandwidth = number_slots * 12.5e9 #in Hz
         current_service.center_frequency = self._calculate_center_frequency(self.current_service)
         
         # Update counters
@@ -1587,7 +2036,7 @@ class RMSAEnv(OpticalNetworkEnv):
             link_idx = self.topology[node1][node2]["index"]
             offset = link_idx + (self.topology.number_of_edges() * service.band)
             
-            allocation_slice = slice(service.initial_slot, service.initial_slot + service.number_slots)
+            allocation_slice = slice(service.global_initial_slot, service.global_initial_slot + service.number_slots)
             
             # FIX: Validate that the service ID matches before releasing
             allocated_services = self.spectrum_slots_allocation[offset, allocation_slice]
@@ -1629,3 +2078,158 @@ class RMSAEnv(OpticalNetworkEnv):
         
         # Update network fragmentation after deallocation
         self._update_network_fragmentation()
+
+    # ====== ADD THESE HELPER METHODS AT END OF RMSAEnv CLASS ======
+
+    def _get_spectrum_availability_details(self, path, initial_slot, slots, band):
+        """Get detailed spectrum availability for logging"""
+        details = {
+            'required_slots': slots,
+            'initial_slot_local': initial_slot,
+            'band': 'C-band' if band == 0 else 'L-band',
+            'band_range': f"{self.get_shift(band)[0]}-{self.get_shift(band)[1]}",
+            'global_slot_range': f"{initial_slot + self.get_shift(band)[0]}-"
+                            f"{initial_slot + self.get_shift(band)[0] + slots - 1}",
+            'link_availability': []
+        }
+        
+        x = self.get_shift(band)[0]
+        initial_slot_global = initial_slot + x
+        
+        for i in range(len(path.node_list) - 1):
+            node1, node2 = path.node_list[i], path.node_list[i+1]
+            link_idx = self.topology[node1][node2]['index']
+            offset = link_idx + (self.topology.number_of_edges() * band)
+            
+            link_spectrum = self.topology.graph['available_slots'][
+                offset,
+                initial_slot_global:initial_slot_global + slots
+            ]
+            
+            is_available = np.all(link_spectrum == 1)
+            
+            details['link_availability'].append({
+                'link': f"{node1}→{node2}",
+                'index': link_idx,
+                'available': is_available,
+                'occupied_slots': list(np.where(link_spectrum == 0)[0]) if not is_available else []
+            })
+        
+        return details
+
+    def _get_affected_services_details(self):
+        """Get details of services affected by OSNR interference"""
+        affected = []
+        
+        if not hasattr(self, '_affected_services_osnr_before'):
+            return affected
+        
+        for service_id, osnr_before in self._affected_services_osnr_before.items():
+            osnr_after = self._affected_services_osnr_after.get(service_id)
+            
+            service = next((s for s in self.topology.graph['running_services'] 
+                        if s.service_id == service_id), None)
+            
+            if service and osnr_after:
+                affected.append({
+                    'service_id': service_id,
+                    'osnr_before': osnr_before,
+                    'osnr_after': osnr_after,
+                    'osnr_degradation': osnr_before - osnr_after,
+                    'threshold': self.OSNR_th.get(service.modulation_format, 0),
+                    'margin_before': osnr_before - self.OSNR_th.get(service.modulation_format, 0),
+                    'margin_after': osnr_after - self.OSNR_th.get(service.modulation_format, 0),
+                    'would_fail': osnr_after < self.OSNR_th.get(service.modulation_format, 0)
+                })
+        
+        return affected
+
+    def _get_rejection_details(self, blocking_reason):
+        """Get detailed information about rejection"""
+        details = {'reason': blocking_reason}
+        
+        if blocking_reason == 'spectrum_unavailable':
+            details['note'] = "No contiguous spectrum block found"
+        elif blocking_reason == 'osnr_threshold_violation':
+            details['note'] = "Service OSNR below modulation threshold"
+        elif blocking_reason == 'osnr_interference_violation':
+            details['note'] = "Would degrade existing services below threshold"
+            details['affected_services'] = self._get_affected_services_details()
+        elif blocking_reason == 'path_length_exceeded':
+            details['note'] = "Path too long for any available modulation"
+        elif blocking_reason == 'no_modulation_available':
+            details['note'] = "No modulation format supports this path length"
+        elif blocking_reason == 'invalid_action':
+            details['note'] = "Invalid action indices"
+        
+        return details
+
+    def _log_network_state_after_allocation(self, path, band):
+        """Log network state after allocation"""
+        if not self.request_logger:
+            return
+        
+        for i in range(len(path.node_list) - 1):
+            node1, node2 = path.node_list[i], path.node_list[i+1]
+            link_idx = self.topology[node1][node2]['index']
+            
+            running_services = self.topology[node1][node2]['running_services']
+            
+            band_start, band_end = self.get_shift(band)
+            spectrum = self.topology.graph['available_slots'][
+                link_idx + (self.topology.number_of_edges() * band),
+                band_start:band_end
+            ]
+            
+            occupied_slots = np.sum(spectrum == 0)
+            total_slots = band_end - band_start
+            utilization = occupied_slots / total_slots
+            
+            self.request_logger.log_link_state(
+                link=f"{node1}→{node2}",
+                link_index=link_idx,
+                band=band,
+                num_services=len(running_services),
+                occupied_slots=occupied_slots,
+                total_slots=total_slots,
+                utilization=utilization,
+                running_services=[
+                    {
+                        'service_id': s.service_id,
+                        'slots': f"{s.initial_slot}-{s.initial_slot+s.number_slots-1}",
+                        'bit_rate': s.bit_rate,
+                        'modulation': s.modulation_format if hasattr(s, 'modulation_format') else None,
+                        'osnr_db': s.current_OSNR if hasattr(s, 'current_OSNR') else None
+                    }
+                    for s in running_services
+                ]
+            )
+
+    def _calculate_network_utilization(self):
+        """Calculate overall network utilization"""
+        total_slots = self.num_spectrum_resources * self.topology.number_of_edges() * self.num_bands
+        available = np.sum(self.topology.graph["available_slots"])
+        occupied = total_slots - available
+        return occupied / total_slots if total_slots > 0 else 0.0
+
+    def _calculate_band_utilization(self):
+        """Calculate per-band utilization"""
+        num_edges = self.topology.number_of_edges()
+        utilization = {}
+        
+        for band in range(self.num_bands):
+            band_start, band_end = self.get_shift(band)
+            band_size = band_end - band_start
+            total_slots = band_size * num_edges
+            
+            available = 0
+            for edge_idx in range(num_edges):
+                offset = edge_idx + (num_edges * band)
+                available += np.sum(self.topology.graph["available_slots"][offset, band_start:band_end])
+            
+            occupied = total_slots - available
+            utilization[band] = occupied / total_slots if total_slots > 0 else 0.0
+        
+        return utilization
+
+# ==============================================================
